@@ -90,9 +90,25 @@ const googleMapsKey = import.meta.env.VITE_GOOGLE_MAPS_KEY as string | undefined
 let googleMapsPromise: Promise<void> | null = null
 
 const loadGoogleMaps = (key: string) => {
-  if (window.google?.maps) {
+  if (window.google?.maps?.Map) {
     return Promise.resolve(window.google)
   }
+
+  const waitForMaps = () =>
+    new Promise<typeof window.google>((resolve, reject) => {
+      const startedAt = Date.now()
+      const timer = window.setInterval(() => {
+        if (window.google?.maps?.Map) {
+          window.clearInterval(timer)
+          resolve(window.google)
+          return
+        }
+        if (Date.now() - startedAt > 8000) {
+          window.clearInterval(timer)
+          reject(new Error('Google Maps no está disponible.'))
+        }
+      }, 100)
+    })
 
   if (!googleMapsPromise) {
     googleMapsPromise = new Promise((resolve, reject) => {
@@ -102,7 +118,9 @@ const loadGoogleMaps = (key: string) => {
       ) as HTMLScriptElement | null
       if (existing) {
         if (existing.src === desiredSrc) {
-          existing.addEventListener('load', () => resolve(window.google))
+          existing.addEventListener('load', () => {
+            waitForMaps().then(resolve).catch(reject)
+          })
           existing.addEventListener('error', () =>
             reject(new Error('No se pudo cargar Google Maps.'))
           )
@@ -116,7 +134,9 @@ const loadGoogleMaps = (key: string) => {
       script.src = desiredSrc
       script.async = true
       script.defer = true
-      script.onload = () => resolve(window.google)
+      script.onload = () => {
+        waitForMaps().then(resolve).catch(reject)
+      }
       script.onerror = () => reject(new Error('No se pudo cargar Google Maps.'))
       document.head.appendChild(script)
     })
