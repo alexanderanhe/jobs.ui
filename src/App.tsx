@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useRef, useState, useEffect } from 'react'
-import { FiBriefcase, FiMapPin, FiSearch, FiTag, FiZap } from 'react-icons/fi'
+import { FiBriefcase, FiMapPin, FiSearch, FiTag, FiX, FiZap } from 'react-icons/fi'
 import { useInBoundsJobs } from './hooks/useInBoundsJobs'
 import { useJobsList } from './hooks/useJobsList'
 import type { Job } from './types/jobs'
@@ -20,30 +20,103 @@ declare global {
 }
 
 const formatCity = (job: Job) => job.city || job.addressText || '—'
+const formatCompactNumber = (value: number) => {
+  const compact = new Intl.NumberFormat('en', {
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(value)
+  return compact.replace(/\s/g, '').toUpperCase()
+}
+
+const formatSalaryLabel = (job: Job) => {
+  const currency = job.currency || 'MXN'
+  const currencyLabel = currency === 'MXN' ? 'MN' : currency
+  const value =
+    typeof job.salaryMin === 'number'
+      ? job.salaryMin
+      : typeof job.salaryMax === 'number'
+      ? job.salaryMax
+      : null
+  if (!value) return ''
+  return `${currencyLabel} ${formatCompactNumber(value)}`
+}
+
+const formatSalaryFull = (job: Job) => {
+  const currency = job.currency || 'MXN'
+  const min = typeof job.salaryMin === 'number' ? job.salaryMin : null
+  const max = typeof job.salaryMax === 'number' ? job.salaryMax : null
+  if (min && max) {
+    return `${currency} ${min.toLocaleString('es-MX')} - ${max.toLocaleString('es-MX')}`
+  }
+  if (min || max) {
+    const value = min ?? max ?? 0
+    return `${currency} ${value.toLocaleString('es-MX')}`
+  }
+  return '—'
+}
+
+const buildSalaryMarkerSvg = (label: string) => {
+  const hasLabel = Boolean(label)
+  const textLength = label.length
+  const width = Math.max(54, textLength * 7 + 26)
+  const labelHeight = hasLabel ? 26 : 0
+  const gap = hasLabel ? 8 : 0
+  const dotRadius = 8
+  const height = labelHeight + gap + dotRadius * 2
+  const bg = '#f97316'
+  const dotFill = '#f97316'
+
+  const svg = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+    hasLabel
+      ? `<rect x="0" y="0" width="${width}" height="${labelHeight}" rx="8" fill="${bg}"/>`
+      : '',
+    hasLabel
+      ? `<text x="${width / 2}" y="17" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#ffffff">${label}</text>`
+      : '',
+    `<circle cx="${width / 2}" cy="${labelHeight + gap + dotRadius}" r="${dotRadius}" fill="${dotFill}" stroke="#ffffff" stroke-width="2"/>`,
+    '</svg>',
+  ].join('')
+
+  return {
+    url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`,
+    width,
+    height,
+    anchor: { x: width / 2, y: labelHeight + gap + dotRadius },
+  }
+}
 
 const googleMapsKey = import.meta.env.VITE_GOOGLE_MAPS_KEY as string | undefined
 let googleMapsPromise: Promise<void> | null = null
 
 const loadGoogleMaps = (key: string) => {
   if (window.google?.maps) {
-    return Promise.resolve()
+    return Promise.resolve(window.google)
   }
 
   if (!googleMapsPromise) {
     googleMapsPromise = new Promise((resolve, reject) => {
-      const existing = document.querySelector('script[data-google-maps="true"]')
+      const desiredSrc = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=marker&v=weekly&loading=async`
+      const existing = document.querySelector(
+        'script[data-google-maps="true"]'
+      ) as HTMLScriptElement | null
       if (existing) {
-        existing.addEventListener('load', () => resolve())
-        existing.addEventListener('error', () => reject(new Error('No se pudo cargar Google Maps.')))
-        return
+        if (existing.src === desiredSrc) {
+          existing.addEventListener('load', () => resolve(window.google))
+          existing.addEventListener('error', () =>
+            reject(new Error('No se pudo cargar Google Maps.'))
+          )
+          return
+        }
+        existing.remove()
       }
 
       const script = document.createElement('script')
       script.dataset.googleMaps = 'true'
-      script.src = `https://maps.googleapis.com/maps/api/js?key=${key}`
+      script.src = desiredSrc
       script.async = true
       script.defer = true
-      script.onload = () => resolve()
+      script.onload = () => resolve(window.google)
       script.onerror = () => reject(new Error('No se pudo cargar Google Maps.'))
       document.head.appendChild(script)
     })
@@ -55,9 +128,13 @@ const loadGoogleMaps = (key: string) => {
 function MapView({
   onBoundsChanged,
   jobs,
+  selectedJobId,
+  onSelectJob,
 }: {
   onBoundsChanged: (bounds: BoundsLiteral) => void
   jobs?: Job[]
+  selectedJobId: string | null
+  onSelectJob: (jobId: string) => void
 }) {
   const mapRef = useRef<HTMLDivElement | null>(null)
   const mapInstanceRef = useRef<any>(null)
@@ -85,6 +162,9 @@ function MapView({
         }
 
         if (!mapInstanceRef.current) {
+          if (!window.google?.maps?.Map) {
+            throw new Error('Google Maps no está disponible.')
+          }
           mapInstanceRef.current = new window.google.maps.Map(mapRef.current, {
             center: { lat: 19.4326, lng: -99.1332 },
             zoom: 11,
@@ -147,7 +227,13 @@ function MapView({
         }
 
         const map = mapInstanceRef.current
-        markersRef.current.forEach((marker) => marker.setMap(null))
+        markersRef.current.forEach((marker) => {
+          if (marker.map !== undefined) {
+            marker.map = null
+          } else if (marker.setMap) {
+            marker.setMap(null)
+          }
+        })
         markersRef.current = []
 
         if (!jobs || jobs.length === 0) {
@@ -165,11 +251,20 @@ function MapView({
 
           const position = { lat, lng }
           lastPosition = position
+          const label = formatSalaryLabel(job)
+          const svgIcon = buildSalaryMarkerSvg(label)
+
           const marker = new window.google.maps.Marker({
             position,
             map,
             title: job.title,
+            icon: {
+              url: svgIcon.url,
+              scaledSize: new window.google.maps.Size(svgIcon.width, svgIcon.height),
+              anchor: new window.google.maps.Point(svgIcon.anchor.x, svgIcon.anchor.y),
+            },
           })
+          marker.addListener('click', () => onSelectJob(job.id))
           markersRef.current.push(marker)
           bounds.extend(position)
         })
@@ -190,7 +285,7 @@ function MapView({
     return () => {
       cancelled = true
     }
-  }, [jobs, mapReady])
+  }, [jobs, mapReady, selectedJobId, onSelectJob])
 
   return (
     <>
@@ -211,6 +306,7 @@ function App() {
     remoteType: '',
     tags: '',
   })
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
 
   const jobsList = useJobsList()
   const [bounds, setBounds] = useState<BoundsLiteral | null>(null)
@@ -240,11 +336,22 @@ function App() {
       page: 1,
       limit: 20,
     })
+    setSelectedJobId(null)
   }
+
+  const selectedJob = useMemo(() => {
+    if (!selectedJobId) return null
+    return jobsList.data?.items.find((job) => job.id === selectedJobId) ?? null
+  }, [jobsList.data, selectedJobId])
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-slate-950 text-slate-900">
-      <MapView onBoundsChanged={onMapMove} jobs={jobsList.data?.items} />
+      <MapView
+        onBoundsChanged={onMapMove}
+        jobs={jobsList.data?.items}
+        selectedJobId={selectedJobId}
+        onSelectJob={setSelectedJobId}
+      />
 
       {import.meta.env.DEV && (
         <div className="absolute bottom-6 left-6 z-30 rounded-full bg-white/80 px-3 py-1 text-[11px] font-semibold text-slate-700 shadow-md backdrop-blur">
@@ -329,15 +436,98 @@ function App() {
               <div className="px-4 py-3 text-sm text-red-600">{jobsList.error}</div>
             )}
             <div className="min-h-0 flex-1 divide-y divide-slate-200/70 overflow-y-auto">
-              {jobsList.data?.items.map((job) => (
-                <div key={job.id} className="px-4 py-3">
+            {jobsList.data?.items.map((job) => {
+              const isSelected = job.id === selectedJobId
+              return (
+                <button
+                  key={job.id}
+                  type="button"
+                  onClick={() => setSelectedJobId(job.id)}
+                  className={`w-full px-4 py-3 text-left transition ${
+                    isSelected ? 'bg-slate-900/5' : 'hover:bg-slate-50'
+                  }`}
+                >
                   <div className="text-sm font-semibold text-slate-900">{job.title}</div>
                   <div className="mt-1 text-xs text-slate-500">
                     {job.company || '—'} · {formatCity(job)} · {job.remoteType || '—'}
                   </div>
-                </div>
-              ))}
+                </button>
+              )
+            })}
             </div>
+          </div>
+        </section>
+      )}
+
+      {selectedJob && (
+        <section className="absolute left-6 bottom-6 z-20 w-[min(380px,94vw)] rounded-2xl border border-slate-900/10 bg-white/95 p-4 shadow-2xl backdrop-blur max-[900px]:left-4 max-[900px]:right-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-slate-900">{selectedJob.title}</div>
+              <div className="mt-1 text-xs text-slate-500">
+                {selectedJob.company || '—'} · {formatCity(selectedJob)} ·{' '}
+                {selectedJob.remoteType || '—'}
+              </div>
+            </div>
+            <button
+              type="button"
+              aria-label="Cerrar"
+              className="flex h-7 w-7 items-center justify-center rounded-full border border-slate-200 text-slate-500 transition hover:border-slate-300 hover:text-slate-700"
+              onClick={() => setSelectedJobId(null)}
+            >
+              <FiX className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="mt-3 grid grid-cols-2 gap-3 text-xs text-slate-600">
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                Salario
+              </div>
+              <div className="mt-1 font-semibold text-slate-900">
+                {formatSalaryFull(selectedJob)}
+              </div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                Ubicación
+              </div>
+              <div className="mt-1 font-semibold text-slate-900">
+                {selectedJob.addressText || selectedJob.city || '—'}
+              </div>
+            </div>
+            {selectedJob.tags?.length ? (
+              <div className="col-span-2">
+                <div className="text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                  Tags
+                </div>
+                <div className="mt-1 flex flex-wrap gap-2">
+                  {selectedJob.tags.map((tag) => (
+                    <span
+                      key={tag}
+                      className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600"
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {selectedJob.description ? (
+              <div className="col-span-2 text-[11px] text-slate-500">
+                {selectedJob.description}
+              </div>
+            ) : null}
+            {selectedJob.applyUrl ? (
+              <a
+                className="col-span-2 inline-flex items-center justify-center rounded-lg bg-slate-900 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white shadow-md"
+                href={selectedJob.applyUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Ver oferta
+              </a>
+            ) : null}
           </div>
         </section>
       )}
